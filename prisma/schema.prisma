@@ -1,0 +1,797 @@
+// HostelMS — Prisma Schema
+// Version: 1.1
+// Scope: Location 1 (multi-location ready)
+// DB: PostgreSQL (Neon / Supabase)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+}
+
+// ─────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────
+
+enum Role {
+  Student
+  Parent
+  Warden
+  ChiefWarden
+  Security
+  Facilities
+  Admin          // new — manages feature flags and system configuration
+}
+
+enum Gender {
+  Male
+  Female
+  Other
+}
+
+enum RoomState {
+  Vacant
+  Occupied
+  Blocked
+  Staff
+}
+
+enum RoomHistoryEvent {
+  Allocated    // student or staff moved in
+  Vacated      // student or staff moved out
+  Blocked      // warden blocked the room
+  Unblocked    // warden unblocked the room
+  TransferIn   // student transferred into this room
+  TransferOut  // student transferred out of this room
+}
+
+enum GatepassStatus {
+  Request        // submitted by student, awaiting parent
+  ParentApproval // parent approved, awaiting warden
+  WardenApproval // warden approved, student cleared to exit
+  Exit           // biometric exit recorded
+  Returned       // biometric entry recorded on time
+  ReturnedLate   // biometric entry recorded past expected return
+  Rejected       // rejected by parent or warden
+}
+
+enum MaintenanceStatus {
+  Pending
+  InProgress
+  Resolved
+}
+
+enum MachineType {
+  Washer
+  Dryer
+}
+
+enum MachineState {
+  Free
+  InUse
+  GracePeriod
+  Maintenance
+}
+
+enum FeedbackStatus {
+  Submitted
+  Acknowledged
+  InReview
+  Resolved
+  Escalated
+}
+
+enum ShiftFlag {
+  MissedLogout // guard never pressed end-shift; flagged for warden review
+}
+
+// Feed entry type — lets the API filter or re-render entries by purpose
+// without parsing the human-readable message string.
+enum LaundryFeedEntryType {
+  SessionStart
+  FiveMinWarning
+  TimerEnd
+  GracePeriodStart
+  MoveToAvailableDryer
+  MoveToBasket
+  MoveToTable
+  DryerRestartBySelf
+  DryerRestartByOther
+  MachineEmptied        // clothes collected (by owner) or moved out (by someone else); machine is Free again
+}
+
+// Notification category — lets the client filter the notification panel
+// (e.g. show only gatepass notifications) without parsing the title string.
+// Also carries the entity type + ID needed to deep-link to the source record.
+enum NotificationCategory {
+  Gatepass
+  Maintenance
+  Feedback
+  Laundry
+  Shift
+  System
+}
+
+// ─────────────────────────────────────────────
+// LOCATION
+// ─────────────────────────────────────────────
+
+model Location {
+  id        String   @id @default(cuid())
+  name      String
+  address   String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  blocks           Block[]
+  laundryRooms     LaundryRoom[]
+  featureFlags     FeatureFlag[]
+  facilitiesStaff  FacilitiesStaff[]
+}
+// ─────────────────────────────────────────────
+// USER (single auth table for all roles)
+// ─────────────────────────────────────────────
+
+// Every person who logs in has exactly one User record.
+// Role-specific data lives in separate profile tables linked by userId.
+// This keeps auth, sessions, notifications, and audit log role-agnostic.
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  role         Role
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime? // soft delete — deactivated accounts are never hard-deleted
+
+  // Profile relations — exactly one of these will be non-null per user
+  student         Student?
+  parent          Parent?
+  warden          Warden?
+  securityGuard   SecurityGuard?
+  facilitiesStaff FacilitiesStaff?
+  admin           Admin?
+
+  // Cross-cutting relations
+  notifications Notification[]
+  auditLogsActed AuditLog[]    @relation("AuditActor")
+  refreshTokens  RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+
+  @@index([role])
+  @@index([email])
+}
+
+// Refresh tokens stored in DB to support revocation.
+// Access tokens are short-lived JWTs checked against Redis blacklist on every request.
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────
+// STAFF PROFILES
+// ─────────────────────────────────────────────
+
+model Student {
+  id             String    @id @default(cuid())
+  userId         String    @unique
+  rollNumber     String    @unique
+  name           String
+  photoUrl       String?   // Cloudinary URL
+  course         String?
+  year           Int?
+  gender         Gender
+  phone          String?
+  whatsappNumber String?
+  roomId         String?   @unique // null = not yet allocated; @unique enforces single-sharing
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  user             User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  room             Room?                @relation(fields: [roomId], references: [id], onDelete: SetNull)
+  parent           Parent?
+  secondaryContact SecondaryContact?
+  gatepasses       Gatepass[]
+  maintenanceReqs  MaintenanceRequest[]
+  laundrySessions  LaundrySession[]     @relation("OwnedSessions")
+  laundryRestarts  LaundrySession[]     @relation("RestartedSessions")
+  feedback         Feedback[]           @relation("StudentFeedback")
+  noticeComments   NoticeComment[]
+
+  @@index([rollNumber])
+  @@index([roomId])
+}
+
+// Parent is a first-class user with their own login, linked to exactly one student.
+model Parent {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  studentId String   @unique // one parent record per student
+  name      String
+  phone     String?
+  email     String?  // may differ from User.email (the login email)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  student  Student    @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  feedback Feedback[] @relation("ParentFeedback")
+}
+
+// Secondary contact — not a system user, just stored data on the student record.
+// Managed by warden only.
+model SecondaryContact {
+  id        String   @id @default(cuid())
+  studentId String   @unique
+  name      String?
+  phone     String?
+  email     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+}
+
+model Warden {
+  id        String    @id @default(cuid())
+  userId    String    @unique
+  name      String
+  phone     String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  blockWardens    BlockWarden[]
+  notices         Notice[]
+  feedbackHandled Feedback[]    @relation("WardenFeedback")
+}
+
+model SecurityGuard {
+  id        String    @id @default(cuid())
+  userId    String    @unique
+  name      String
+  phone     String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  user             User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  blockAssignments BlockSecurity[]
+  shifts           Shift[]
+}
+
+model FacilitiesStaff {
+  id         String    @id @default(cuid())
+  userId     String    @unique
+  locationId String
+  name       String
+  phone      String?
+  department String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Restrict)
+
+  @@index([locationId])
+}
+
+model Admin {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────────────────────────
+// PHYSICAL STRUCTURE
+// ─────────────────────────────────────────────
+
+model Block {
+  id         String   @id @default(cuid())
+  locationId String
+  name       String   // e.g. "A", "B", "E"
+  gender     Gender   // Male / Female — determines which students can be allocated
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  location         Location           @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  rooms            Room[]
+  blockWardens     BlockWarden[]
+  blockSecurity    BlockSecurity[]
+  laundryRoomLinks LaundryRoomBlock[]
+  gatepasses       Gatepass[]         @relation("BlockGatepasses")
+  maintenanceReqs  MaintenanceRequest[]
+  notices          NoticeBlock[]
+  feedback         Feedback[]         @relation("BlockFeedback")
+  shifts           Shift[]
+
+  @@unique([locationId, name]) // block names are unique within a location
+  @@index([locationId])
+}
+
+// Warden ↔ Block — many-to-many with history.
+// A warden can manage multiple blocks; a block has at most one active warden at a time.
+// Active = removedAt IS NULL. PostgreSQL cannot express this as a simple @@unique
+// because the condition involves a nullable column. Enforce at the API level:
+// before inserting, verify no row exists with the same blockId where removedAt IS NULL.
+model BlockWarden {
+  id         String    @id @default(cuid())
+  blockId    String
+  wardenId   String
+  assignedAt DateTime  @default(now())
+  removedAt  DateTime? // null = currently active
+
+  block  Block  @relation(fields: [blockId], references: [id], onDelete: Cascade)
+  warden Warden @relation(fields: [wardenId], references: [id], onDelete: Cascade)
+
+  @@index([blockId])
+  @@index([wardenId])
+}
+
+// Security ↔ Block — many-to-many with history.
+model BlockSecurity {
+  id         String    @id @default(cuid())
+  blockId    String
+  guardId    String
+  assignedAt DateTime  @default(now())
+  removedAt  DateTime?
+
+  block Block         @relation(fields: [blockId], references: [id], onDelete: Cascade)
+  guard SecurityGuard @relation(fields: [guardId], references: [id], onDelete: Cascade)
+
+  @@index([blockId])
+  @@index([guardId])
+}
+
+model Room {
+  id            String    @id @default(cuid())
+  blockId       String
+  roomNumber    String    // e.g. "101", "204"
+  floor         Int
+  maxOccupancy  Int       @default(1) // 1 = single sharing; 2 = double sharing for future locations
+  state         RoomState @default(Vacant)
+  blockedReason String?   // populated when state = Blocked
+  blockedAt     DateTime? // when the room was last blocked
+  blockedById   String?   // User.id of the warden or chief warden who blocked it (plain String)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  block           Block                @relation(fields: [blockId], references: [id], onDelete: Restrict)
+  student         Student?             // current student occupant (1-1 via Student.roomId @unique)
+  staffOccupant   StaffRoom?           // current staff occupant
+  history         RoomHistory[]
+  maintenanceReqs MaintenanceRequest[]
+
+  @@unique([blockId, roomNumber])
+  @@index([blockId])
+}
+
+// Staff occupying a room are not system users — name/designation stored here.
+model StaffRoom {
+  id          String   @id @default(cuid())
+  roomId      String   @unique
+  name        String
+  designation String?
+  phone       String?
+  allocatedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+}
+
+// Append-only log of every room state transition. Never delete rows.
+model RoomHistory {
+  id        String           @id @default(cuid())
+  roomId    String
+  event     RoomHistoryEvent
+  actorId   String?          // Warden userId — plain String, not a relation (survives soft-delete)
+  studentId String?          // populated for Allocated / Vacated / Transfer events
+  staffName String?          // populated for staff allocation events
+  reason    String?          // populated for Blocked events
+  note      String?
+  createdAt DateTime         @default(now())
+
+  room Room @relation(fields: [roomId], references: [id], onDelete: Restrict)
+
+  @@index([roomId])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────
+// GATEPASS
+// ─────────────────────────────────────────────
+
+model Gatepass {
+  id                 String         @id @default(cuid())
+  studentId          String
+  blockId            String         // denormalised for fast block-scoped queries
+  status             GatepassStatus @default(Request)
+  date               DateTime       // the date of the outing
+  departureTime      DateTime       // expected departure
+  expectedReturnTime DateTime       // expected return
+  reason             String
+
+  // Approval chain
+  parentApprovedAt DateTime?
+  parentRejectedAt DateTime?
+  parentRejectedBy String?   // Parent.id (profile ID, not User.id)
+  wardenApprovedAt DateTime?
+  wardenRejectedAt DateTime?
+  wardenRejectedBy String?   // Warden.id (profile ID, not User.id)
+
+  // Biometric timestamps — written by hardware integration only, never by users
+  exitTime  DateTime?
+  entryTime DateTime?
+  isLate    Boolean   @default(false)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  block   Block   @relation("BlockGatepasses", fields: [blockId], references: [id], onDelete: Restrict)
+
+  @@index([studentId])
+  @@index([blockId])
+  @@index([status])
+  @@index([date])
+}
+
+// ─────────────────────────────────────────────
+// MAINTENANCE
+// ─────────────────────────────────────────────
+
+model MaintenanceRequest {
+  id          String            @id @default(cuid())
+  studentId   String
+  roomId      String
+  blockId     String            // denormalised for block-scoped queries
+  description String
+  status      MaintenanceStatus @default(Pending)
+
+  // One timestamp per status transition
+  pendingAt    DateTime @default(now())
+  inProgressAt DateTime?
+  resolvedAt   DateTime?
+
+  // Reopen tracking
+  reopenCount  Int      @default(0)
+  lastReopenAt DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  room    Room    @relation(fields: [roomId], references: [id], onDelete: Restrict)
+  block   Block   @relation(fields: [blockId], references: [id], onDelete: Restrict)
+
+  @@index([studentId])
+  @@index([blockId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────
+// LAUNDRY
+// ─────────────────────────────────────────────
+
+model LaundryRoom {
+  id         String   @id @default(cuid())
+  locationId String
+  name       String   // e.g. "Boys Laundry", "Girls Laundry"
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  location    Location           @relation(fields: [locationId], references: [id], onDelete: Restrict)
+  blockLinks  LaundryRoomBlock[]
+  machines    Machine[]
+  feedEntries LaundryFeedEntry[]
+  sessions    LaundrySession[]
+
+  @@index([locationId])
+}
+
+// Block ↔ LaundryRoom join table.
+// Location 1: A/B/C/D → boys room; E/F → girls room.
+// Future locations: different groupings, no schema change needed — just new rows.
+model LaundryRoomBlock {
+  id            String @id @default(cuid())
+  laundryRoomId String
+  blockId       String
+
+  laundryRoom LaundryRoom @relation(fields: [laundryRoomId], references: [id], onDelete: Cascade)
+  block       Block       @relation(fields: [blockId], references: [id], onDelete: Cascade)
+
+  @@unique([laundryRoomId, blockId])
+}
+
+model Machine {
+  id            String       @id @default(cuid())
+  laundryRoomId String
+  type          MachineType
+  label         String       // e.g. "Washer 1", "Dryer 2"
+  state         MachineState @default(Free)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  deletedAt     DateTime?    // retired when a warden lowers the machine count; rows are kept because sessions reference them
+
+  laundryRoom LaundryRoom      @relation(fields: [laundryRoomId], references: [id], onDelete: Restrict)
+  sessions    LaundrySession[]
+
+  @@index([laundryRoomId])
+  @@index([state])
+}
+
+model LaundrySession {
+  id                String    @id @default(cuid())
+  machineId         String
+  studentId         String
+  laundryRoomId     String    // denormalised for feed scoping
+  durationMinutes   Int       // set by student (1–60)
+  startedAt         DateTime  @default(now())
+  endsAt            DateTime  // startedAt + durationMinutes
+  gracePeriodEndsAt DateTime?
+  endedAt           DateTime? // null = still active or in grace
+
+  // Timer bookkeeping (written only by lib/laundry.ts, never by users)
+  warnedAt   DateTime? // set once the 5-minute warning has been sent, so it is never sent twice
+  graceStage Int      @default(0) // 0 = first 10 min to collect; 1 = extra wait because all dryers were busy; 2 = final move instruction posted
+
+  // Dryer restart tracking
+  restartedByStudentId String?
+  isRestartedByOther   Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  machine     Machine  @relation(fields: [machineId], references: [id], onDelete: Restrict)
+  student     Student  @relation("OwnedSessions", fields: [studentId], references: [id], onDelete: Restrict)
+  restartedBy Student? @relation("RestartedSessions", fields: [restartedByStudentId], references: [id], onDelete: SetNull)
+  laundryRoom LaundryRoom @relation(fields: [laundryRoomId], references: [id], onDelete: Restrict)
+
+  @@index([machineId])
+  @@index([studentId])
+  @@index([laundryRoomId])
+  @@index([endedAt, endsAt])
+}
+
+// Stored feed messages — loaded on page open, then updated via Supabase Realtime.
+// messageType allows filtering/re-rendering without parsing the message string.
+model LaundryFeedEntry {
+  id            String               @id @default(cuid())
+  laundryRoomId String
+  messageType   LaundryFeedEntryType
+  message       String               // human-readable text shown in the feed
+  sessionId     String?              // optional link back to the LaundrySession that triggered this
+  createdAt     DateTime             @default(now())
+
+  laundryRoom LaundryRoom @relation(fields: [laundryRoomId], references: [id], onDelete: Cascade)
+
+  @@index([laundryRoomId])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────
+// NOTICE BOARD
+// ─────────────────────────────────────────────
+
+model Notice {
+  id        String    @id @default(cuid())
+  wardenId  String?   // Warden.id when a warden posted it; null when the chief warden did
+  postedByUserId String // User.id of whoever posted (warden or chief warden)
+  title     String
+  body      String
+  expiresAt DateTime? // null = non-expiring
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  // onDelete Restrict: warden must not be hard-deleted while they have notices.
+  // Soft-delete the warden (deletedAt) instead.
+  warden   Warden?         @relation(fields: [wardenId], references: [id], onDelete: Restrict)
+  blocks   NoticeBlock[]
+  comments NoticeComment[]
+}
+
+// Notice ↔ Block join — a notice can target multiple blocks.
+model NoticeBlock {
+  id       String @id @default(cuid())
+  noticeId String
+  blockId  String
+
+  notice Notice @relation(fields: [noticeId], references: [id], onDelete: Cascade)
+  block  Block  @relation(fields: [blockId], references: [id], onDelete: Cascade)
+
+  @@unique([noticeId, blockId])
+}
+
+model NoticeComment {
+  id         String   @id @default(cuid())
+  noticeId   String
+  studentId  String?  // set when a student wrote it
+  authorUserId String // User.id of the author (student, warden or chief warden)
+  authorRole Role
+  authorName String   // snapshot so the thread still reads correctly later
+  parentId   String?  // top-level comment this replies to (threads are one level deep)
+  body       String
+  createdAt  DateTime @default(now())
+
+  // Cascade: deleting a notice hard-deletes its comments (PRD: delete is permanent).
+  notice  Notice          @relation(fields: [noticeId], references: [id], onDelete: Cascade)
+  student Student?        @relation(fields: [studentId], references: [id], onDelete: SetNull)
+  parent  NoticeComment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies NoticeComment[] @relation("CommentReplies")
+
+  @@index([noticeId])
+  @@index([parentId])
+}
+
+// ─────────────────────────────────────────────
+// FEEDBACK
+// ─────────────────────────────────────────────
+
+model Feedback {
+  id       String         @id @default(cuid())
+  blockId  String         // routed to this block's warden
+  studentId String?        // null if raised by parent independently
+  parentId  String?        // null if raised by student
+  wardenId  String?        // block warden assigned at submission time
+  body     String
+  status   FeedbackStatus @default(Submitted)
+
+  acknowledgedAt DateTime?
+  inReviewAt     DateTime?
+  resolvedAt     DateTime?
+  escalatedAt    DateTime?
+  escalationNote String?   // internal: visible to wardens and chief warden only, never to students or parents
+
+  // Tracks which chief warden resolved an escalated item and when.
+  // chiefWardenUserId is a plain String (User.id) — not a profile relation —
+  // because ChiefWarden has no separate profile model (uses User + Role directly).
+  chiefWardenUserId  String?
+  chiefWardenResolvedAt DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  block   Block    @relation("BlockFeedback", fields: [blockId], references: [id], onDelete: Restrict)
+  student Student? @relation("StudentFeedback", fields: [studentId], references: [id], onDelete: SetNull)
+  parent  Parent?  @relation("ParentFeedback", fields: [parentId], references: [id], onDelete: SetNull)
+  warden  Warden?  @relation("WardenFeedback", fields: [wardenId], references: [id], onDelete: SetNull)
+
+  @@index([blockId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────
+// NOTIFICATIONS
+// ─────────────────────────────────────────────
+
+model Notification {
+  id          String               @id @default(cuid())
+  recipientId String               // User.id
+  category    NotificationCategory // for filtering the notification panel by type
+  title       String
+  body        String
+  linkEntity  String?              // e.g. "Gatepass", "MaintenanceRequest" — for deep-linking
+  linkId      String?              // ID of the linked record
+  isRead      Boolean              @default(false)
+  createdAt   DateTime             @default(now())
+
+  recipient User @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+
+  @@index([recipientId])
+  @@index([isRead])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────
+// SECURITY SHIFTS
+// ─────────────────────────────────────────────
+
+model Shift {
+  id        String     @id @default(cuid())
+  guardId   String
+  blockId   String
+  shiftIn   DateTime
+  shiftOut  DateTime?  // null = still active, or MissedLogout flag set
+  flag      ShiftFlag?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  guard SecurityGuard @relation(fields: [guardId], references: [id], onDelete: Restrict)
+  block Block         @relation(fields: [blockId], references: [id], onDelete: Restrict)
+
+  @@index([guardId])
+  @@index([blockId])
+  @@index([shiftIn])
+}
+
+// ─────────────────────────────────────────────
+// AUDIT LOG
+// ─────────────────────────────────────────────
+
+// Append-only. No updates or deletes on this table, ever.
+// actorId is a plain String (not a Prisma relation) so the record survives
+// if the user account is soft-deleted or hard-deleted.
+// The @relation("AuditActor") is kept on User for convenient Prisma joins
+// while the actor account still exists.
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorId      String   // User.id — plain String intentionally
+  actorRole    Role
+  action       String   // e.g. "ROOM_ALLOCATED", "GATEPASS_WARDEN_APPROVED"
+  targetEntity String   // e.g. "Room", "Gatepass", "Student"
+  targetId     String   // ID of the affected record
+  snapshot     Json?    // before/after diff of changed fields
+  createdAt    DateTime @default(now())
+
+  actor User @relation("AuditActor", fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([actorId])
+  @@index([targetEntity, targetId])
+  @@index([createdAt])
+}
+
+// ── 3. Add FeatureFlag model ──────────────────
+// Place after the AuditLog model (end of schema)
+
+// Permission matrix controlled by Admin.
+// Each row represents whether a given feature is enabled
+// for a given role at a given location.
+//
+// feature    — e.g. "laundry", "gatepass", "maintenance", "notices"
+// role       — which role this flag applies to
+// locationId — scoped to a specific location (or all if you add a global flag later)
+// enabled    — true = feature is on; false = feature is off
+//
+// If no row exists for a feature+role+location combination,
+// treat it as enabled by default (opt-out model).
+// Flip to opt-in at the application layer if needed later.
+
+model FeatureFlag {
+  id         String   @id @default(cuid())
+  feature    String   // e.g. "laundry", "gatepass", "maintenance"
+  role       Role     // which role this flag applies to
+  locationId String   // scoped to a location
+  enabled    Boolean  @default(true)
+  updatedAt  DateTime @updatedAt
+  updatedBy  String?  // Admin User.id — plain String (survives account changes)
+
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([feature, role, locationId]) // one flag per feature+role+location
+  @@index([locationId])
+  @@index([feature])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
